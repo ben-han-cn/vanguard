@@ -9,24 +9,29 @@ import (
 	"github.com/ben-han-cn/vanguard/logger"
 )
 
-func buildMessage(qname, ip string, ttl int) *g53.Message {
+func buildMessage(name_ string, ips []string, ttl int) *g53.Message {
 	header := g53.Header{
 		Id:      1000,
 		Opcode:  g53.OP_QUERY,
 		Rcode:   g53.R_NOERROR,
 		QDCount: 1,
-		ANCount: 1,
+		ANCount: 2,
 		NSCount: 0,
-		ARCount: 0,
+		ARCount: 1,
 	}
 
-	name, _ := g53.NameFromString(qname)
+	name := g53.NameFromStringUnsafe(name_)
 	question := &g53.Question{
 		Name:  name,
 		Type:  g53.RR_A,
 		Class: g53.CLASS_IN,
 	}
-	rdata, _ := g53.AFromString(ip)
+
+	rdatas := make([]g53.Rdata, 0, len(ips))
+	for _, ip := range ips {
+		rdata, _ := g53.AFromString(ip)
+		rdatas = append(rdatas, rdata)
+	}
 
 	var answer g53.Section
 	answer = append(answer, &g53.RRset{
@@ -34,13 +39,18 @@ func buildMessage(qname, ip string, ttl int) *g53.Message {
 		Type:   g53.RR_A,
 		Class:  g53.CLASS_IN,
 		Ttl:    g53.RRTTL(ttl),
-		Rdatas: []g53.Rdata{rdata},
+		Rdatas: rdatas,
 	})
 
 	return &g53.Message{
 		Header:   header,
 		Question: question,
 		Sections: [...]g53.Section{answer, []*g53.RRset{}, []*g53.RRset{}},
+		Edns: &g53.EDNS{
+			Version:     0,
+			UdpSize:     4096,
+			DnssecAware: false,
+		},
 	}
 }
 
@@ -50,7 +60,7 @@ func TestMessageCache(t *testing.T) {
 
 	ut.Equal(t, cache.Len(), 0)
 
-	message := buildMessage("test.example.com.", "1.1.1.1", 3)
+	message := buildMessage("test.example.com.", []string{"1.1.1.1"}, 3)
 	cache.Add(message)
 	ut.Equal(t, cache.Len(), 1)
 
@@ -64,14 +74,14 @@ func TestMessageCache(t *testing.T) {
 	cache.Add(message)
 	ut.Equal(t, cache.Len(), 1)
 
-	message1 := buildMessage("test1.example.com.", "1.1.1.1", 3)
+	message1 := buildMessage("test1.example.com.", []string{"1.1.1.1"}, 3)
 	cache.Add(message1)
 	ut.Equal(t, cache.Len(), 2)
-	message2 := buildMessage("test2.example.com.", "1.1.1.1", 3)
+	message2 := buildMessage("test2.example.com.", []string{"1.1.1.1"}, 3)
 	cache.Add(message2)
 	ut.Equal(t, cache.Len(), 3)
 
-	message3 := buildMessage("test3.example.com.", "1.1.1.1", 3)
+	message3 := buildMessage("test3.example.com.", []string{"1.1.1.1"}, 3)
 	cache.Add(message3)
 	ut.Equal(t, cache.Len(), 3)
 
@@ -80,7 +90,7 @@ func TestMessageCache(t *testing.T) {
 	ut.Assert(t, found == false, "message should expired")
 	ut.Equal(t, cache.Len(), 3)
 
-	cache.Add(buildMessage("test.example.com.", "2.2.2.2", 30))
+	cache.Add(buildMessage("test.example.com.", []string{"2.2.2.2", "1.1.1.1"}, 30))
 	ut.Equal(t, cache.Len(), 3)
 	message, found = cache.Get(request)
 	ut.Assert(t, found == true, "message shouldn't expired")

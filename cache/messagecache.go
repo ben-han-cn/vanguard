@@ -1,12 +1,12 @@
 package cache
 
 import (
-	"github.com/ben-han-cn/g53"
-
 	"container/list"
 	"math"
 	"sync"
 	"time"
+
+	"github.com/ben-han-cn/g53"
 )
 
 const (
@@ -72,13 +72,13 @@ func (c *MessageCache) Get(req *g53.Message) (*g53.Message, bool) {
 	if rrsetCount > 0 {
 		rrsets = make([]*g53.RRset, rrsetCount)
 		for i, hash := range me.rrsets {
-			re, found := c.rrsetCache.get(hash.keyHash, hash.conflictHash)
+			rrset, found := c.rrsetCache.get(hash.keyHash, hash.conflictHash)
 			if !found {
 				c.remove(keyHash, conflictHash)
 				c.mu.Unlock()
 				return nil, false
 			}
-			rrsets[i] = re.rrset
+			rrsets[i] = rrset
 		}
 	}
 	c.mu.Unlock()
@@ -131,39 +131,42 @@ func (c *MessageCache) Add(msg *g53.Message) {
 func positiveMsgToEntry(msg *g53.Message) (MessageEntry, []RRsetEntry) {
 	keyHash, conflictHash := HashQuery(msg.Question.Name, msg.Question.Type)
 	me := MessageEntry{
-		keyHash:         keyHash,
-		conflictHash:    conflictHash,
-		rcode:           msg.Header.Rcode,
-		answerCount:     msg.Header.ANCount,
-		authorityCount:  msg.Header.NSCount,
-		additionalCount: msg.Header.ARCount,
+		keyHash:      keyHash,
+		conflictHash: conflictHash,
+		rcode:        msg.Header.Rcode,
 	}
 
-	rrsetCount := msg.Header.ANCount + msg.Header.NSCount + msg.Header.ARCount
-	rrsets := make([]RRsetHash, rrsetCount)
-	rrsetEntries := make([]RRsetEntry, rrsetCount)
-	j := 0
+	rrCount := msg.Header.ANCount + msg.Header.NSCount + msg.Header.ARCount
+	rrsets := make([]RRsetHash, 0, rrCount)
+	rrsetEntries := make([]RRsetEntry, 0, rrCount)
 	msgTtl := g53.RRTTL(math.MaxUint32)
 	for _, sec := range []g53.SectionType{g53.AnswerSection, g53.AuthSection, g53.AdditionalSection} {
 		for _, rrset := range msg.GetSection(sec) {
+			if sec == g53.AnswerSection {
+				me.answerCount += 1
+			} else if sec == g53.AuthSection {
+				me.authorityCount += 1
+			} else {
+				me.additionalCount += 1
+			}
+
 			keyHash, conflictHash := HashQuery(rrset.Name, rrset.Type)
-			rrsets[j] = RRsetHash{
+			rrsets = append(rrsets, RRsetHash{
 				keyHash:      keyHash,
 				conflictHash: conflictHash,
-			}
+			})
 
 			if msgTtl > rrset.Ttl {
 				msgTtl = rrset.Ttl
 			}
 
-			rrsetEntries[j] = RRsetEntry{
+			rrsetEntries = append(rrsetEntries, RRsetEntry{
 				keyHash:      keyHash,
 				conflictHash: conflictHash,
 				rrset:        rrset,
 				trustLevel:   getRRsetTrustLevel(msg, sec),
 				expireTime:   time.Now().Add(time.Second * time.Duration(rrset.Ttl)),
-			}
-			j++
+			})
 		}
 	}
 	me.rrsets = rrsets

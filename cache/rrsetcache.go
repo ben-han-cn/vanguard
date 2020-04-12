@@ -45,16 +45,16 @@ func newRRsetCache(cap int) *RRsetCache {
 }
 
 func (c *RRsetCache) add(es []RRsetEntry) {
-	for _, e := range es {
+	for i, e := range es {
 		if elem, ok := c.data[e.keyHash]; ok {
 			oe := elem.Value.(*RRsetEntry)
-			if !oe.IsExpire() && e.trustLevel <= oe.trustLevel {
+			if !oe.IsExpire() && e.trustLevel < oe.trustLevel {
 				return
 			}
 			c.ll.MoveToFront(elem)
-			elem.Value = &e
+			elem.Value = &es[i]
 		} else if c.ll.Len() < c.cap {
-			elem := c.ll.PushFront(&e)
+			elem := c.ll.PushFront(&es[i])
 			c.data[e.keyHash] = elem
 		} else {
 			//reuse last elem
@@ -68,12 +68,15 @@ func (c *RRsetCache) add(es []RRsetEntry) {
 	}
 }
 
-func (c *RRsetCache) get(keyHash, conflictHash uint64) (*RRsetEntry, bool) {
+func (c *RRsetCache) get(keyHash, conflictHash uint64) (*g53.RRset, bool) {
 	if elem, hit := c.data[keyHash]; hit {
 		e := elem.Value.(*RRsetEntry)
-		if e.conflictHash == conflictHash && !e.IsExpire() {
+		now := time.Now()
+		if e.conflictHash == conflictHash && e.expireTime.After(now) {
 			c.ll.MoveToFront(elem)
-			return e, true
+			rrset := *e.rrset
+			rrset.Ttl = g53.RRTTL(e.expireTime.Sub(now).Seconds())
+			return &rrset, true
 		}
 	}
 	return nil, false

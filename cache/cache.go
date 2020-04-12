@@ -32,7 +32,7 @@ func (c *Cache) ReloadConfig(conf *config.VanguardConf) {
 		}
 	}
 
-	if defaultCache, exist := cache[view.DefaultView]; exist == false {
+	if defaultCache, exist := cache[view.DefaultView]; !exist {
 		cache[view.DefaultView] = newViewCache(int(conf.Cache.MaxCacheSize))
 	} else {
 		defaultCache.ResetCapacity(int(conf.Cache.MaxCacheSize))
@@ -43,11 +43,12 @@ func (c *Cache) ReloadConfig(conf *config.VanguardConf) {
 
 func (c *Cache) HandleQuery(ctx *core.Context) {
 	client := &ctx.Client
-	message, found := c.get(client)
+	msg, found := c.get(client)
 	client.CacheHit = found
-	if found == true {
+
+	if found {
 		metrics.RecordCacheHit(client.View)
-		response := *message
+		response := *msg
 		response.Header.Id = client.Request.Header.Id
 		response.Header.SetFlag(g53.FLAG_AA, false)
 		response.Question = client.Request.Question
@@ -60,9 +61,9 @@ func (c *Cache) HandleQuery(ctx *core.Context) {
 	}
 }
 
-func (c *Cache) AddMessage(view string, message *g53.Message) {
+func (c *Cache) AddMessage(view string, msg *g53.Message) {
 	if messageCache, ok := c.cache[view]; ok {
-		messageCache.Add(message)
+		messageCache.Add(msg)
 	}
 }
 
