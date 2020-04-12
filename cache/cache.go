@@ -11,7 +11,7 @@ import (
 
 type Cache struct {
 	core.DefaultHandler
-	cache map[string]*MessageCache
+	cache map[string]*ViewCache
 }
 
 func NewCache(conf *config.VanguardConf) core.DNSQueryHandler {
@@ -22,20 +22,20 @@ func NewCache(conf *config.VanguardConf) core.DNSQueryHandler {
 }
 
 func (c *Cache) ReloadConfig(conf *config.VanguardConf) {
-	cache := make(map[string]*MessageCache)
+	cache := make(map[string]*ViewCache)
 	for view, _ := range view.GetViewAndIds() {
 		if _, exist := c.cache[view]; exist {
 			cache[view] = c.cache[view]
-			cache[view].reloadConfig(&conf.Cache)
+			cache[view].ResetCapacity(int(conf.Cache.MaxCacheSize))
 		} else {
-			cache[view] = newMessageCache(&conf.Cache, c)
+			cache[view] = newViewCache(int(conf.Cache.MaxCacheSize))
 		}
 	}
 
 	if defaultCache, exist := cache[view.DefaultView]; exist == false {
-		cache[view.DefaultView] = newMessageCache(&conf.Cache, c)
+		cache[view.DefaultView] = newViewCache(int(conf.Cache.MaxCacheSize))
 	} else {
-		defaultCache.reloadConfig(&conf.Cache)
+		defaultCache.ResetCapacity(int(conf.Cache.MaxCacheSize))
 	}
 
 	c.cache = cache
@@ -68,7 +68,7 @@ func (c *Cache) AddMessage(view string, message *g53.Message) {
 
 func (c *Cache) get(client *core.Client) (*g53.Message, bool) {
 	if messageCache, ok := c.cache[client.View]; ok {
-		return messageCache.Get(client)
+		return messageCache.Get(client.Request)
 	} else {
 		return nil, false
 	}

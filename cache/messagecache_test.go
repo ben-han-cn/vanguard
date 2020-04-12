@@ -6,8 +6,6 @@ import (
 
 	ut "github.com/ben-han-cn/cement/unittest"
 	"github.com/ben-han-cn/g53"
-	"github.com/ben-han-cn/vanguard/config"
-	"github.com/ben-han-cn/vanguard/core"
 	"github.com/ben-han-cn/vanguard/logger"
 )
 
@@ -48,16 +46,7 @@ func buildMessage(qname, ip string, ttl int) *g53.Message {
 
 func TestMessageCache(t *testing.T) {
 	logger.UseDefaultLogger("debug")
-	maxSize := uint(3)
-	conf := &config.CacheConf{
-		PositiveTtl:  60,
-		NegativeTtl:  60,
-		MaxCacheSize: maxSize,
-		ShortAnswer:  true,
-		Prefetch:     false,
-	}
-
-	cache := newMessageCache(conf, nil)
+	cache := newMessageCache(3)
 
 	ut.Equal(t, cache.Len(), 0)
 
@@ -66,10 +55,9 @@ func TestMessageCache(t *testing.T) {
 	ut.Equal(t, cache.Len(), 1)
 
 	qname, _ := g53.NameFromString("test.example.com.")
-	client := &core.Client{
-		Request: g53.MakeQuery(qname, g53.RR_A, 512, false),
-	}
-	message, found := cache.Get(client)
+	request := g53.MakeQuery(qname, g53.RR_A, 512, false)
+	request.Header.Id = 1000
+	message, found := cache.Get(request)
 	ut.Assert(t, found == true, "message should be fetched")
 	ut.Equal(t, message.Header.Id, uint16(1000))
 
@@ -88,18 +76,18 @@ func TestMessageCache(t *testing.T) {
 	ut.Equal(t, cache.Len(), 3)
 
 	<-time.After(4 * time.Second)
-	_, found = cache.Get(client)
+	_, found = cache.Get(request)
 	ut.Assert(t, found == false, "message should expired")
 	ut.Equal(t, cache.Len(), 3)
 
 	cache.Add(buildMessage("test.example.com.", "2.2.2.2", 30))
 	ut.Equal(t, cache.Len(), 3)
-	message, found = cache.Get(client)
+	message, found = cache.Get(request)
 	ut.Assert(t, found == true, "message shouldn't expired")
 	ut.Equal(t, message.Sections[g53.AnswerSection][0].Rdatas[0].String(), "2.2.2.2")
 
 	cache.Remove(qname, g53.RR_A)
-	_, found = cache.Get(client)
+	_, found = cache.Get(request)
 	ut.Assert(t, found == false, "message should be cleaned")
 	ut.Equal(t, cache.Len(), 2)
 }

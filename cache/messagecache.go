@@ -1,259 +1,299 @@
 package cache
 
 import (
+	"github.com/ben-han-cn/g53"
+
 	"container/list"
+	"math"
 	"sync"
 	"time"
-
-	"github.com/ben-han-cn/g53"
-	"github.com/ben-han-cn/vanguard/config"
-	"github.com/ben-han-cn/vanguard/core"
-	"github.com/ben-han-cn/vanguard/logger"
 )
 
 const (
-	defaultNegativeCacheTtl uint32 = 60   //1 minute
-	defaultPositiveCacheTtl uint32 = 3600 //1 Hour
-	defaultMaxCacheSize     uint   = 0
-	prefetchTime                   = 10
+	RRsetVsMessageRatio = 5
 )
 
-type Key uint64
-
-type MessageCacheEntry struct {
-	message    *g53.Message
-	expireTime time.Time
+type RRsetHash struct {
+	keyHash      uint64
+	conflictHash uint64
 }
 
-func (e *MessageCacheEntry) Message() *g53.Message {
-	return e.message
+type MessageEntry struct {
+	keyHash         uint64
+	conflictHash    uint64
+	rcode           g53.Rcode
+	answerCount     uint16
+	authorityCount  uint16
+	additionalCount uint16
+	rrsets          []RRsetHash
+	expireTime      time.Time
 }
 
-func (e *MessageCacheEntry) IsExpire() bool {
+func (e *MessageEntry) IsExpire() bool {
 	return e.expireTime.Before(time.Now())
 }
 
-func (e *MessageCacheEntry) NeedPrefetch() bool {
-	return e.expireTime.Before(time.Now().Add(prefetchTime * time.Second))
-}
-
 type MessageCache struct {
-	positiveTtl  uint32
-	negativeTtl  uint32
-	maxSize      uint
-	shortAnswer  bool
-	needPrefetch bool
-
+	cap        int
+	data       map[uint64]*list.Element
 	ll         *list.List
-	cache      map[Key]*list.Element
-	lock       sync.RWMutex
-	prefetcher *Prefetcher
+	mu         sync.Mutex
+	rrsetCache *RRsetCache
 }
 
-func newMessageCache(conf *config.CacheConf, handler core.DNSQueryHandler) *MessageCache {
-	c := &MessageCache{
-		ll:    list.New(),
-		cache: make(map[Key]*list.Element),
-	}
-
-	c.prefetcher = newPrefetcher(handler, c)
-	c.reloadConfig(conf)
-	return c
-}
-
-func (c *MessageCache) reloadConfig(conf *config.CacheConf) {
-	if c.needPrefetch {
-		c.prefetcher.stop()
-	}
-
-	positiveTtl := conf.PositiveTtl
-	if positiveTtl == 0 {
-		positiveTtl = defaultPositiveCacheTtl
-	}
-
-	negativeTtl := conf.NegativeTtl
-	if negativeTtl == 0 {
-		negativeTtl = defaultNegativeCacheTtl
-	}
-
-	c.positiveTtl = positiveTtl
-	c.negativeTtl = negativeTtl
-	c.maxSize = conf.MaxCacheSize
-	c.shortAnswer = conf.ShortAnswer
-
-	if conf.Prefetch {
-		c.needPrefetch = true
-		c.prefetcher.reloadConfig()
-		go c.prefetcher.run()
+func newMessageCache(cap int) *MessageCache {
+	return &MessageCache{
+		ll:         list.New(),
+		data:       make(map[uint64]*list.Element),
+		cap:        cap,
+		rrsetCache: newRRsetCache(cap * RRsetVsMessageRatio),
 	}
 }
 
-func (c *MessageCache) Add(message *g53.Message) {
-	entry := c.messageToCache(message)
-	if entry == nil {
-		return
-	}
+func (c *MessageCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	key := keyForMessage(message.Question.Name, message.Question.Type)
-	c.lock.Lock()
-	c.add(key, entry)
-	c.lock.Unlock()
+	return len(c.data)
 }
 
-func (c *MessageCache) add(key Key, entry *MessageCacheEntry) {
-	if elem, ok := c.cache[key]; ok {
-		c.ll.MoveToFront(elem)
-		elem.Value = entry
-	} else {
-		elem := c.ll.PushFront(entry)
-		c.cache[key] = elem
-	}
-	if c.maxSize != defaultMaxCacheSize && uint(c.ll.Len()) > c.maxSize {
-		logger.GetLogger().Debug("cache messages size %v exceeded max size %v, will remove oldest one",
-			c.ll.Len(), c.maxSize)
-		c.removeOldest()
-	}
-}
+func (c *MessageCache) Get(req *g53.Message) (*g53.Message, bool) {
+	c.mu.Lock()
 
-func (c *MessageCache) messageToCache(message *g53.Message) *MessageCacheEntry {
-	message.Header.SetFlag(g53.FLAG_RA, true)
-
-	answers := message.Sections[g53.AnswerSection]
-	ancount := len(answers)
-	if ancount > 0 {
-		return c.positiveMessageToCache(message)
-	} else {
-		return c.negativeMessageToCache(message)
-	}
-}
-
-func (c *MessageCache) negativeMessageToCache(message *g53.Message) *MessageCacheEntry {
-	auths := message.Sections[g53.AuthSection]
-	minTtl := c.negativeTtl
-	//auth section may includes soa
-	if len(auths) == 1 && auths[0].Type == g53.RR_SOA && len(auths[0].Rdatas) == 1 {
-		soa := auths[0]
-		if rdata, ok := soa.Rdatas[0].(*g53.SOA); ok {
-			if minTtl > rdata.Minimum {
-				minTtl = rdata.Minimum
-			}
-			soaTtl := uint32(soa.Ttl)
-			if soaTtl < minTtl {
-				minTtl = soaTtl
-			} else {
-				soa.Ttl = g53.RRTTL(minTtl)
-			}
-		}
-	}
-
-	if c.shortAnswer {
-		message.ClearSection(g53.AdditionalSection)
-	}
-
-	return &MessageCacheEntry{
-		message:    message,
-		expireTime: time.Now().Add(time.Duration(minTtl) * time.Second),
-	}
-}
-
-func (c *MessageCache) positiveMessageToCache(message *g53.Message) *MessageCacheEntry {
-	if c.shortAnswer {
-		message.ClearSection(g53.AuthSection)
-		message.ClearSection(g53.AdditionalSection)
-	}
-
-	answers := message.Sections[g53.AnswerSection]
-	minTtl := c.positiveTtl
-	ancount := len(answers)
-	for i := 0; i < ancount; i++ {
-		ttl := uint32(answers[i].Ttl)
-		if ttl < minTtl {
-			minTtl = ttl
-		} else if ttl > c.positiveTtl {
-			answers[i].Ttl = g53.RRTTL(c.positiveTtl)
-		}
-	}
-
-	return &MessageCacheEntry{
-		message:    message,
-		expireTime: time.Now().Add(time.Second * time.Duration(minTtl)),
-	}
-}
-
-func keyForMessage(name *g53.Name, typ g53.RRType) Key {
-	hash := uint64(name.Hash(false))
-	return Key((hash << 32) | uint64(typ))
-}
-
-func (c *MessageCache) Get(client *core.Client) (*g53.Message, bool) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if entry, found := c.get(client.Request.Question.Name, client.Request.Question.Type); found {
-		if c.needPrefetch && entry.NeedPrefetch() {
-			c.prefetcher.addPrefetchTask(client)
-		}
-		return entry.Message(), true
-	} else {
+	keyHash, conflictHash := HashQuery(req.Question.Name, req.Question.Type)
+	me, found := c.get(keyHash, conflictHash)
+	if !found {
+		c.mu.Unlock()
 		return nil, false
 	}
+
+	var rrsets []*g53.RRset
+	rrsetCount := me.answerCount + me.authorityCount + me.additionalCount
+	if rrsetCount > 0 {
+		rrsets = make([]*g53.RRset, rrsetCount)
+		for i, hash := range me.rrsets {
+			re, found := c.rrsetCache.get(hash.keyHash, hash.conflictHash)
+			if !found {
+				c.remove(keyHash, conflictHash)
+				c.mu.Unlock()
+				return nil, false
+			}
+			rrsets[i] = re.rrset
+		}
+	}
+	c.mu.Unlock()
+
+	resp := req.MakeResponse()
+	j := 0
+	for i := uint16(0); i < me.answerCount; i++ {
+		resp.AddRRset(g53.AnswerSection, rrsets[j])
+		j++
+	}
+	for i := uint16(0); i < me.authorityCount; i++ {
+		resp.AddRRset(g53.AuthSection, rrsets[j])
+		j++
+	}
+	for i := uint16(0); i < me.additionalCount; i++ {
+		resp.AddRRset(g53.AdditionalSection, rrsets[j])
+		j++
+	}
+	resp.Header.Rcode = me.rcode
+	resp.RecalculateSectionRRCount()
+	return resp, true
 }
 
-func (c *MessageCache) get(name *g53.Name, typ g53.RRType) (*MessageCacheEntry, bool) {
-	key := keyForMessage(name, typ)
-	if elem, hit := c.cache[key]; hit {
-		entry := elem.Value.(*MessageCacheEntry)
-		if entry.IsExpire() == false && entry.message.Question.Name.Equals(name) {
+func (c *MessageCache) get(keyHash, conflictHash uint64) (*MessageEntry, bool) {
+	if elem, hit := c.data[keyHash]; hit {
+		e := elem.Value.(*MessageEntry)
+		if e.conflictHash == conflictHash && !e.IsExpire() {
 			c.ll.MoveToFront(elem)
-			roundrobinAnswer(entry.message)
-			return entry, true
+			return e, true
 		}
 	}
 	return nil, false
 }
 
-func (c *MessageCache) Remove(name *g53.Name, typ g53.RRType) {
-	key := keyForMessage(name, typ)
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if ele, hit := c.cache[key]; hit {
-		c.removeElement(ele)
+func (c *MessageCache) Add(msg *g53.Message) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if msg.Header.ANCount == 0 {
+		e, res := negativeMessageToEntry(msg)
+		c.add(e)
+		c.rrsetCache.add(res)
+	} else {
+		e, res := positiveMsgToEntry(msg)
+		c.add(e)
+		c.rrsetCache.add(res)
 	}
 }
 
-func (c *MessageCache) removeOldest() {
-	ele := c.ll.Back()
-	if ele != nil {
-		c.removeElement(ele)
+func positiveMsgToEntry(msg *g53.Message) (MessageEntry, []RRsetEntry) {
+	keyHash, conflictHash := HashQuery(msg.Question.Name, msg.Question.Type)
+	me := MessageEntry{
+		keyHash:         keyHash,
+		conflictHash:    conflictHash,
+		rcode:           msg.Header.Rcode,
+		answerCount:     msg.Header.ANCount,
+		authorityCount:  msg.Header.NSCount,
+		additionalCount: msg.Header.ARCount,
 	}
-}
 
-func (c *MessageCache) removeElement(e *list.Element) {
-	c.ll.Remove(e)
-	message := e.Value.(*MessageCacheEntry).message
-	key := keyForMessage(message.Question.Name, message.Question.Type)
-	delete(c.cache, key)
-}
+	rrsetCount := msg.Header.ANCount + msg.Header.NSCount + msg.Header.ARCount
+	rrsets := make([]RRsetHash, rrsetCount)
+	rrsetEntries := make([]RRsetEntry, rrsetCount)
+	j := 0
+	msgTtl := g53.RRTTL(math.MaxUint32)
+	for _, sec := range []g53.SectionType{g53.AnswerSection, g53.AuthSection, g53.AdditionalSection} {
+		for _, rrset := range msg.GetSection(sec) {
+			keyHash, conflictHash := HashQuery(rrset.Name, rrset.Type)
+			rrsets[j] = RRsetHash{
+				keyHash:      keyHash,
+				conflictHash: conflictHash,
+			}
 
-func (c *MessageCache) Len() int {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+			if msgTtl > rrset.Ttl {
+				msgTtl = rrset.Ttl
+			}
 
-	return c.ll.Len()
-}
-
-func (c *MessageCache) Clear() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	c.ll.Init()
-	c.cache = make(map[Key]*list.Element)
-}
-
-func roundrobinAnswer(msg *g53.Message) {
-	answers := msg.Sections[g53.AnswerSection]
-	for _, rrset := range answers {
-		if len(rrset.Rdatas) > 1 {
-			rrset.RotateRdata()
+			rrsetEntries[j] = RRsetEntry{
+				keyHash:      keyHash,
+				conflictHash: conflictHash,
+				rrset:        rrset,
+				trustLevel:   getRRsetTrustLevel(msg, sec),
+				expireTime:   time.Now().Add(time.Second * time.Duration(rrset.Ttl)),
+			}
+			j++
 		}
 	}
+	me.rrsets = rrsets
+	me.expireTime = time.Now().Add(time.Second * time.Duration(msgTtl))
+	return me, rrsetEntries
+}
+
+func negativeMessageToEntry(msg *g53.Message) (MessageEntry, []RRsetEntry) {
+	keyHash, conflictHash := HashQuery(msg.Question.Name, msg.Question.Type)
+	me := MessageEntry{
+		keyHash:         keyHash,
+		conflictHash:    conflictHash,
+		rcode:           msg.Header.Rcode,
+		answerCount:     0,
+		additionalCount: 0,
+	}
+
+	msgTtl := uint32(math.MaxUint32)
+	auths := msg.GetSection(g53.AuthSection)
+	rrsetEntries := make([]RRsetEntry, 0, 1)
+	rrsets := make([]RRsetHash, 0, 1)
+	if len(auths) == 1 && auths[0].Type == g53.RR_SOA && len(auths[0].Rdatas) == 1 {
+		me.authorityCount = 1
+		soa := auths[0]
+		keyHash, conflictHash := HashQuery(soa.Name, soa.Type)
+		rrsets = append(rrsets, RRsetHash{
+			keyHash:      keyHash,
+			conflictHash: conflictHash,
+		})
+
+		rrsetEntries = append(rrsetEntries, RRsetEntry{
+			keyHash:      keyHash,
+			conflictHash: conflictHash,
+			rrset:        soa,
+			trustLevel:   getRRsetTrustLevel(msg, g53.AuthSection),
+			expireTime:   time.Now().Add(time.Second * time.Duration(soa.Ttl)),
+		})
+
+		rdata, _ := soa.Rdatas[0].(*g53.SOA)
+		if msgTtl > rdata.Minimum {
+			msgTtl = rdata.Minimum
+		}
+		if msgTtl > uint32(soa.Ttl) {
+			msgTtl = uint32(soa.Ttl)
+		}
+	}
+	me.rrsets = rrsets
+	me.expireTime = time.Now().Add(time.Second * time.Duration(msgTtl))
+	return me, rrsetEntries
+}
+
+func getRRsetTrustLevel(msg *g53.Message, sec g53.SectionType) TrustLevel {
+	aa := msg.Header.GetFlag(g53.FLAG_AA)
+	switch sec {
+	case g53.AnswerSection:
+		if aa {
+			return AnswerWithAA
+		} else {
+			return AnswerWithoutAA
+		}
+	case g53.AuthSection:
+		if aa {
+			return AuthorityWithAA
+		} else {
+			return AuthorityWithoutAA
+		}
+	case g53.AdditionalSection:
+		if aa {
+			return AdditionalWithAA
+		} else {
+			return AdditionalWithoutAA
+		}
+	default:
+		panic("unknown section type")
+	}
+}
+
+func (c *MessageCache) add(e MessageEntry) {
+	if elem, ok := c.data[e.keyHash]; ok {
+		c.ll.MoveToFront(elem)
+		elem.Value = &e
+	} else if c.ll.Len() < c.cap {
+		elem := c.ll.PushFront(&e)
+		c.data[e.keyHash] = elem
+	} else {
+		//reuse last elem
+		elem := c.ll.Back()
+		oe := elem.Value.(*MessageEntry)
+		delete(c.data, oe.keyHash)
+		*oe = e
+		c.data[e.keyHash] = elem
+		c.ll.MoveToFront(elem)
+	}
+}
+
+func (c *MessageCache) ResetCapacity(cap int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cap == cap {
+		return
+	}
+
+	rc := c.ll.Len() - cap
+	for rc > 0 {
+		elem := c.ll.Back()
+		oe := elem.Value.(*MessageEntry)
+		c.remove(oe.keyHash, oe.conflictHash)
+		rc -= 1
+	}
+
+	c.cap = cap
+	c.rrsetCache.cap = RRsetVsMessageRatio * cap
+}
+
+func (c *MessageCache) Remove(name *g53.Name, typ g53.RRType) bool {
+	keyHash, conflictHash := HashQuery(name, typ)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.remove(keyHash, conflictHash)
+}
+
+func (c *MessageCache) remove(keyHash, conflictHash uint64) bool {
+	if elem, hit := c.data[keyHash]; hit {
+		e := elem.Value.(*MessageEntry)
+		if e.conflictHash == conflictHash {
+			delete(c.data, keyHash)
+			c.ll.Remove(elem)
+			return true
+		}
+	}
+	return false
 }

@@ -79,19 +79,11 @@ func (cache *Cache) HandleCmd(cmd httpcmd.Command) (interface{}, *httpcmd.Error)
 }
 
 func (c *Cache) cleanAll() (interface{}, *httpcmd.Error) {
-	for _, msgCache := range c.cache {
-		msgCache.Clear()
-	}
 	return nil, nil
 }
 
 func (c *Cache) cleanInView(view string) (interface{}, *httpcmd.Error) {
-	if msgCache, ok := c.cache[view]; ok {
-		msgCache.Clear()
-		return nil, nil
-	} else {
-		return nil, httpcmd.ErrUnknownView.AddDetail(view)
-	}
+	return nil, nil
 }
 
 func (c *Cache) cleanDomainInView(view string, name string) (interface{}, *httpcmd.Error) {
@@ -108,19 +100,7 @@ func (c *Cache) cleanDomain(name string) (interface{}, *httpcmd.Error) {
 }
 
 func (c *Cache) cleanRRsetsCache(view string, name string, types []g53.RRType) (interface{}, *httpcmd.Error) {
-	rrsetName, err := g53.NameFromString(name)
-	if err != nil {
-		return nil, httpcmd.ErrInvalidName.AddDetail(err.Error())
-	}
-
-	if msgCache, ok := c.cache[view]; ok {
-		for _, typ := range types {
-			msgCache.Remove(rrsetName, typ)
-		}
-		return nil, nil
-	} else {
-		return nil, httpcmd.ErrUnknownView.AddDetail(view)
-	}
+	return nil, nil
 }
 
 type RRInCache struct {
@@ -181,40 +161,5 @@ func (c *Cache) getMessageCacheInView(view, name, typ string) (interface{}, *htt
 }
 
 func (c *Cache) getSingleMessageCache(view string, qname *g53.Name, qtype g53.RRType) ([]RRInCache, *httpcmd.Error) {
-	msgCache, ok := c.cache[view]
-	if ok == false {
-		return nil, nil
-	}
-
-	message, found := msgCache.GetSingleMessageCache(qname, qtype)
-	if found == false {
-		return nil, nil
-	}
-
-	var rrsets []RRInCache
-	name := qname.String(false)
-	for _, rrset := range message.Sections[g53.AnswerSection] {
-		typ := rrset.Type.String()
-		ttl := int(rrset.Ttl)
-		for _, rdata := range rrset.Rdatas {
-			rrsets = append(rrsets, RRInCache{
-				Name:  name,
-				Class: rrset.Class.String(),
-				Type:  typ,
-				Ttl:   ttl,
-				Rdata: rdata.String(),
-			})
-		}
-	}
-	return rrsets, nil
-}
-
-func (c *MessageCache) GetSingleMessageCache(name *g53.Name, typ g53.RRType) (*g53.Message, bool) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if entry, found := c.get(name, typ); found {
-		return entry.Message(), true
-	} else {
-		return nil, false
-	}
+	return nil, nil
 }
