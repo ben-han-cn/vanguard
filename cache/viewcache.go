@@ -46,3 +46,11 @@ func (c *ViewCache) Remove(name *g53.Name, typ g53.RRType) bool {
 		return c.negativeCache.Remove(name, typ)
 	}
 }
+
+func (c *ViewCache) GetDeepestNS(name *g53.Name) (*g53.RRset, bool) {
+	return c.positiveCache.GetDeepestNS(name)
+}
+
+func (c *ViewCache) GetRRset(name *g53.Name, typ g53.RRType) (*g53.RRset, bool) {
+	return c.positiveCache.GetRRset(name, typ)
+}

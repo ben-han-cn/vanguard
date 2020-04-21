@@ -300,3 +300,19 @@ func (c *MessageCache) remove(keyHash, conflictHash uint64) bool {
 	}
 	return false
 }
+
+func (c *MessageCache) GetDeepestNS(name *g53.Name) (*g53.RRset, bool) {
+	keyHash, conflictHash := HashQuery(name, g53.RR_NS)
+	if rrset, ok := c.rrsetCache.get(keyHash, conflictHash); ok {
+		return rrset, true
+	} else if parent, err := name.Parent(1); err == nil {
+		return c.GetDeepestNS(parent)
+	} else {
+		return nil, false
+	}
+}
+
+func (c *MessageCache) GetRRset(name *g53.Name, typ g53.RRType) (*g53.RRset, bool) {
+	keyHash, conflictHash := HashQuery(name, typ)
+	return c.rrsetCache.get(keyHash, conflictHash)
+}

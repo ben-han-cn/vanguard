@@ -38,9 +38,9 @@ type RRsetCache struct {
 
 func newRRsetCache(cap int) *RRsetCache {
 	return &RRsetCache{
-		ll:   list.New(),
-		data: make(map[uint64]*list.Element),
 		cap:  cap,
+		data: make(map[uint64]*list.Element),
+		ll:   list.New(),
 	}
 }
 
@@ -80,6 +80,15 @@ func (c *RRsetCache) get(keyHash, conflictHash uint64) (*g53.RRset, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (c *RRsetCache) has(keyHash, conflictHash uint64) bool {
+	if elem, hit := c.data[keyHash]; hit {
+		e := elem.Value.(*RRsetEntry)
+		return e.conflictHash == conflictHash && e.expireTime.After(time.Now())
+	} else {
+		return false
+	}
 }
 
 func (c *RRsetCache) remove(keyHash, conflictHash uint64) bool {
